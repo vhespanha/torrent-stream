@@ -5,7 +5,7 @@
 
 The streaming torrent engine that [peerflix](https://github.com/mafintosh/peerflix) uses
 
-	npm install torrent-stream
+    npm install torrent-stream
 
 ## How can I help?
 
@@ -17,28 +17,28 @@ The streaming torrent engine that [peerflix](https://github.com/mafintosh/peerfl
 
 torrent-stream is a node module that allows you to access files inside a torrent as node streams.
 
-``` js
-var torrentStream = require('torrent-stream');
+```js
+var torrentStream = require('torrent-stream')
 
-var engine = torrentStream('magnet:my-magnet-link');
+var engine = torrentStream('magnet:my-magnet-link')
 
-engine.on('ready', function() {
-	engine.files.forEach(function(file) {
-		console.log('filename:', file.name);
-		var stream = file.createReadStream();
-		// stream is readable stream to containing the file content
-	});
-});
+engine.on('ready', function () {
+  engine.files.forEach(function (file) {
+    console.log('filename:', file.name)
+    var stream = file.createReadStream()
+    // stream is readable stream to containing the file content
+  })
+})
 ```
 
 You can pass `start` and `end` options to stream to slice the file
 
-``` js
+```js
 // get a stream containing bytes 10-100 inclusive.
 var stream = file.createReadStream({
-	start: 10,
-	end: 100
-});
+  start: 10,
+  end: 100
+})
 ```
 
 Per default no files are downloaded unless you create a stream to them.
@@ -53,7 +53,7 @@ and fetch pieces according to the streams you create.
 
 Create a new engine instance. Options can contain the following
 
-``` js
+```js
 {
 	connections: 100,     // Max amount of peers to be connected to.
 	uploads: 10,          // Number of upload slots.
@@ -133,13 +133,13 @@ The attached [peer-wire-swarm](https://github.com/mafintosh/peer-wire-swarm) ins
 
 #### `engine.swarm.downloaded`
 
-Shows the total bytes downloaded. With this you can know how much you downloaded and how many bytes you still have to download to reach the end of the file. 
+Shows the total bytes downloaded. With this you can know how much you downloaded and how many bytes you still have to download to reach the end of the file.
 
 #### `file = engine.files[...]`
 
 A file in the torrent. They contains the following data
 
-``` js
+```js
 {
 	name: 'my-filename.txt',
 	path: 'my-folder/my-filename.txt',
@@ -161,7 +161,7 @@ Deselects the file which means it won't be downloaded unless someone creates a s
 Create a readable stream to the file. Pieces needed by the stream will be prioritized highly.
 Options can contain the following
 
-``` js
+```js
 {
 	start: startByte,
 	end: endByte

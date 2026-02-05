@@ -1,440 +1,615 @@
+var magnet = require('./lib/magnet')
 var hat = require('hat')
 var pws = require('peer-wire-swarm')
 var bncode = require('bncode')
-var crypto = require('crypto')
 var bitfield = require('bitfield')
 var parseTorrent = require('parse-torrent')
 var mkdirp = require('mkdirp')
+var rimraf = require('rimraf')
 var events = require('events')
 var path = require('path')
 var fs = require('fs')
 var os = require('os')
 var eos = require('end-of-stream')
-var piece = require('torrent-piece')
-var rimraf = require('rimraf')
-var FSChunkStore = require('fs-chunk-store')
-var ImmediateChunkStore = require('immediate-chunk-store')
-var peerDiscovery = require('torrent-discovery')
-var bufferFrom = require('buffer-from')
+var Bagpipe = require('bagpipe')
+var debounce = require('lodash.debounce')
 
 var blocklist = require('ip-set')
+var encode = require('./lib/encode')
 var exchangeMetadata = require('./lib/exchange-metadata')
+var storage = require('./lib/storage')
+var storageCircular = require('./lib/storage-circular')
 var fileStream = require('./lib/file-stream')
+var piece = require('./lib/piece')
 
-var MAX_REQUESTS = 5
-var CHOKE_TIMEOUT = 5000
-var REQUEST_TIMEOUT = 30000
-var SPEED_THRESHOLD = 3 * piece.BLOCK_LENGTH
-var DEFAULT_PORT = 6881
+var SPEED_THRESHOLD = piece.BLOCK_SIZE * 3
+var TMP = fs.existsSync('/tmp') ? '/tmp' : os.tmpdir()
 
-var BAD_PIECE_STRIKES_MAX = 3
-var BAD_PIECE_STRIKES_DURATION = 120000 // 2 minutes
+function noop() {}
 
-var RECHOKE_INTERVAL = 10000
-var RECHOKE_OPTIMISTIC_DURATION = 2
-
-var TMP = fs.existsSync('/tmp') ? '/tmp' : (os.tmpdir ? os.tmpdir() : os.tmpDir())
-
-var noop = function () {}
-
-var sha1 = function (data) {
-  return crypto.createHash('sha1').update(data).digest('hex')
-}
-
-var thruthy = function () {
+function thruthy() {
   return true
 }
 
-var falsy = function () {
+function falsy() {
   return false
 }
 
-var toNumber = function (val) {
-  return val === true ? 1 : (val || 0)
+function toNumber(val) {
+  if (val === true) {
+    return 1
+  } else {
+    return val || 0
+  }
 }
 
-var torrentStream = function (link, opts, cb) {
-  if (typeof opts === 'function') return torrentStream(link, null, opts)
+module.exports = function (link, opts) {
+  // Parse the link
+  if (typeof link === 'string') {
+    link = magnet(link)
+  } else if (Buffer.isBuffer(link)) {
+    link = parseTorrent(link)
+  }
 
-  link = parseTorrent(link)
-  var metadata = link.infoBuffer || null
+  if (!link || !link.infoHash) {
+    throw new Error('You must pass a valid torrent or magnet link')
+  }
+
   var infoHash = link.infoHash
+  var metadata
 
-  if (!opts) opts = {}
-  if (!opts.id) opts.id = '-TS0008-' + hat(48)
-  if (!opts.tmp) opts.tmp = TMP
-  if (!opts.name) opts.name = 'torrent-stream'
-  if (!opts.flood) opts.flood = 0 // Pulse defaults:
-  if (!opts.pulse) opts.pulse = Number.MAX_SAFE_INTEGER // Do not pulse
+  opts = opts || {}
+  opts.id = opts.id || '-TS0008-' + hat(48)
+  opts.path =
+    opts.path ||
+    path.join(opts.tmp || TMP, opts.name || 'torrent-stream', infoHash)
+  opts.flood = opts.flood || 0
+  opts.pulse = opts.pulse || Number.MAX_SAFE_INTEGER
 
-  var usingTmp = false
-  var destroyed = false
-
-  if (!opts.path) {
-    usingTmp = true
-    opts.path = path.join(opts.tmp, opts.name, infoHash)
-  }
-
+  var verificationLen
+  var verificationsCount
   var engine = new events.EventEmitter()
-  var swarm = pws(infoHash, opts.id, { size: (opts.connections || opts.size), speed: 10 })
-  var torrentPath = path.join(opts.tmp, opts.name, infoHash + '.torrent')
+  var swarm = pws(infoHash, opts.id, {
+    size: opts.connections || opts.size,
+    handshakeTimeout: opts.handshakeTimeout,
+    utp: false
+  })
 
-  if (cb) engine.on('ready', cb.bind(null, engine))
-
-  engine.ready = function (cb) {
-    if (engine.torrent) cb()
-    else engine.once('ready', cb)
-  }
-
+  blocklist(opts.blocklist)
+  var torrentPath = path.join(opts.path, 'cache')
   var wires = swarm.wires
   var critical = []
   var refresh = noop
-
-  var rechokeSlots = (opts.uploads === false || opts.uploads === 0) ? 0 : (+opts.uploads || 10)
-  var rechokeOptimistic = null
-  var rechokeOptimisticTime = 0
-  var rechokeIntervalId
+  var verifications = null
 
   engine.infoHash = infoHash
-  engine.metadata = metadata
+  var rechokeIntervalId
+  var rechokeSlots =
+    opts.uploads === false || opts.uploads === 0 ? 0 : +opts.uploads || 5
+  var rechokeOptimistic = null
+  var rechokeOptimisticTime = 0
+
   engine.path = opts.path
   engine.files = []
   engine.selection = []
+  engine.lockedPieces = []
   engine.torrent = null
   engine.bitfield = null
   engine.amInterested = false
   engine.store = null
   engine.swarm = swarm
   engine._flood = opts.flood
-  engine._pulse = opts.pulse
+  engine.pulse = opts.pulse
+  engine.buffer = opts.buffer
 
-  var discovery = peerDiscovery({
-    peerId: bufferFrom(opts.id),
-    dht: (opts.dht !== undefined) ? opts.dht : true,
-    tracker: (opts.tracker !== undefined) ? opts.tracker : true,
-    port: DEFAULT_PORT,
-    announce: opts.trackers
-  })
-  var blocked = blocklist(opts.blocklist)
-
-  discovery.on('peer', function (addr) {
-    if (blocked.contains(addr.split(':')[0])) {
-      engine.emit('blocked-peer', addr)
+  engine.ready = function (cb) {
+    if (engine.torrent) {
+      process.nextTick(cb)
     } else {
-      engine.emit('peer', addr)
-      engine.connect(addr)
+      engine.once('ready', cb)
     }
-  })
+  }
 
-  var ontorrent = function (torrent) {
-    var storage = opts.storage || FSChunkStore
-    engine.store = ImmediateChunkStore(storage(torrent.pieceLength, {
-      files: torrent.files.map(function (file) {
-        return {
-          path: path.join(opts.path, file.path),
-          length: file.length,
-          offset: file.offset
-        }
-      })
-    }))
+  function ontorrent(torrent) {
+    var lastFile = torrent.files[torrent.files.length - 1]
+    verifications = torrent.pieces
+    verificationLen = torrent.pieceLength
+    verificationsCount = Math.ceil(
+      (lastFile.offset + lastFile.length) / verificationLen
+    )
+
+    engine.verified = bitfield(
+      verificationsCount,
+      opts.circularBuffer ? null : path.join(opts.path, 'bitfield')
+    )
+
+    if (opts.virtual) {
+      var virtualPieceLength =
+        torrent.pieceLength > 524288 && torrent.pieceLength % 524288 === 0
+          ? 524288
+          : torrent.pieceLength
+      var pieceCount = Math.ceil(
+        (lastFile.offset + lastFile.length) / virtualPieceLength
+      )
+      torrent.pieceLength = virtualPieceLength
+      torrent.verificationLen = verificationLen
+      torrent.pieces = []
+      for (var i = 0; i !== pieceCount; i++) {
+        torrent.pieces.push(0)
+      }
+    }
+
+    function mapPiece(index) {
+      if (opts.virtual) {
+        return Math.floor((index * torrent.pieceLength) / verificationLen)
+      } else {
+        return index
+      }
+    }
+
+    if (opts.circularBuffer && !opts.buffer) {
+      throw new Error('circularBuffer can only be used with buffer')
+    }
+
+    engine.store = opts.circularBuffer
+      ? storageCircular(opts.path, torrent, opts.circularBuffer, engine)
+      : storage(opts.path, torrent, opts, engine)
+
     engine.torrent = torrent
     engine.bitfield = bitfield(torrent.pieces.length)
 
     var pieceLength = torrent.pieceLength
-    var pieceRemainder = (torrent.length % pieceLength) || pieceLength
+    var pieceRemainder = torrent.length % pieceLength || pieceLength
 
-    var pieces = torrent.pieces.map(function (hash, i) {
-      return piece(i === torrent.pieces.length - 1 ? pieceRemainder : pieceLength)
-    })
-    var reservations = torrent.pieces.map(function () {
+    function getPieceLen(i) {
+      if (i === torrent.pieces.length - 1) {
+        return pieceRemainder
+      } else {
+        return pieceLength
+      }
+    }
+
+    var pieces = (engine.pieces = torrent.pieces.map(function (hash, i) {
+      return piece(getPieceLen(i))
+    }))
+
+    var reservations = (engine.reservations = torrent.pieces.map(function () {
       return []
-    })
+    }))
 
-    process.nextTick(function () {
-      // Gives the user a chance to call engine.listen(PORT) on the same tick,
-      // so discovery will start using the correct torrent port.
-      discovery.setTorrent(torrent)
-    })
+    // Restore state for non-circular buffer
+    if (!opts.circularBuffer) {
+      for (i = 0; i !== torrent.files.length; i++) {
+        if (!fs.existsSync(path.join(opts.path, i + ''))) {
+          var file = torrent.files[i]
+          var startPiece = (file.offset / verificationLen) | 0
+          var endPiece = ((file.offset + file.length - 1) / verificationLen) | 0
+          for (var j = startPiece; j <= endPiece; j++) {
+            engine.verified.set(j, false)
+          }
+        }
+      }
+      for (i = 0; i !== verificationsCount; i++) {
+        if (engine.verified.get(i)) {
+          var start = Math.floor((i * verificationLen) / torrent.pieceLength)
+          var end = Math.floor(
+            ((i + 1) * verificationLen) / torrent.pieceLength
+          )
+          for (j = start; j !== end; j++) {
+            pieces[j] = null
+            engine.bitfield.set(j, true)
+            engine.emit('verify', j)
+          }
+        }
+      }
+    }
 
-    engine.files = torrent.files.map(function (file) {
-      file = Object.create(file)
-      var offsetPiece = (file.offset / torrent.pieceLength) | 0
-      var endPiece = ((file.offset + file.length - 1) / torrent.pieceLength) | 0
+    torrent.files.forEach(function (f) {
+      var sel
+      var file = Object.assign({}, f)
+      var offsetPiece =
+        Math.floor(file.offset / verificationLen) *
+        (verificationLen / torrent.pieceLength)
+      var endPiece =
+        Math.ceil((file.offset + file.length - 1) / verificationLen) *
+        (verificationLen / torrent.pieceLength)
 
       file.deselect = function () {
-        engine.deselect(offsetPiece, endPiece, false)
+        engine.deselect(sel)
       }
 
       file.select = function () {
-        engine.select(offsetPiece, endPiece, false)
+        sel = engine.select(offsetPiece, endPiece, false)
       }
 
       file.createReadStream = function (opts) {
         var stream = fileStream(engine, file, opts)
-
-        var notify = stream.notify.bind(stream)
-        engine.select(stream.startPiece, stream.endPiece, true, notify)
         eos(stream, function () {
-          engine.deselect(stream.startPiece, stream.endPiece, true, notify)
+          engine.deselect(stream.selection)
         })
-
         return stream
       }
 
-      return file
+      engine.files.push(file)
     })
 
-    var oninterestchange = function () {
+    function oninterestchange() {
       var prev = engine.amInterested
       engine.amInterested = !!engine.selection.length
 
       wires.forEach(function (wire) {
-        if (engine.amInterested) wire.interested()
-        else wire.uninterested()
+        if (engine.amInterested) {
+          wire.interested()
+        } else {
+          wire.uninterested()
+        }
       })
 
-      if (prev === engine.amInterested) return
-      if (engine.amInterested) engine.emit('interested')
-      else engine.emit('uninterested')
+      if (prev !== engine.amInterested) {
+        if (engine.amInterested) {
+          engine.emit('interested')
+        } else {
+          engine.emit('uninterested')
+        }
+      }
     }
 
-    var gc = function () {
+    function gc() {
       for (var i = 0; i < engine.selection.length; i++) {
         var s = engine.selection[i]
         var oldOffset = s.offset
 
-        while (!pieces[s.from + s.offset] && s.from + s.offset < s.to) s.offset++
+        while (!pieces[s.from + s.offset] && s.from + s.offset < s.to) {
+          s.offset++
+        }
 
-        if (oldOffset !== s.offset) s.notify()
-        if (s.to !== s.from + s.offset) continue
-        if (pieces[s.from + s.offset]) continue
+        if (oldOffset !== s.offset) {
+          s.notify()
+        }
 
-        engine.selection.splice(i, 1)
-        i-- // -1 to offset splice
-        s.notify()
-        oninterestchange()
+        if (s.to === s.from + s.offset) {
+          if (!pieces[s.from + s.offset]) {
+            engine.selection.splice(i, 1)
+            i--
+            s.notify()
+            oninterestchange()
+          }
+        }
       }
 
-      if (!engine.selection.length) engine.emit('idle')
+      if (!engine.selection.length) {
+        engine.emit('idle')
+      }
     }
 
-    var onpiececomplete = function (index, buffer) {
-      if (!pieces[index]) return
+    var resetpiece = (engine.resetPiece = function (idx) {
+      engine.bitfield.set(idx, false)
+      critical[idx] = null
+      reservations[idx] = []
+      pieces[idx] = piece(getPieceLen(idx))
+    })
 
-      pieces[index] = null
-      reservations[index] = null
-      engine.bitfield.set(index, true)
+    var onhotswap =
+      opts.hotswap === false
+        ? falsy
+        : function (wire, index) {
+            var speed = wire.downloadSpeed()
+            if (speed < piece.BLOCK_SIZE) return false
+            if (!reservations[index] || !pieces[index]) return false
 
-      for (var i = 0; i < wires.length; i++) wires[i].have(index)
+            var r = reservations[index]
+            var minSpeed = Infinity
+            var min
 
-      engine.emit('verify', index)
-      engine.emit('download', index, buffer)
+            for (var i = 0; i < r.length; i++) {
+              var other = r[i]
+              if (other && other !== wire) {
+                var otherSpeed = other.downloadSpeed()
+                if (
+                  otherSpeed < SPEED_THRESHOLD &&
+                  otherSpeed * 2 <= speed &&
+                  otherSpeed <= minSpeed
+                ) {
+                  min = other
+                  minSpeed = otherSpeed
+                }
+              }
+            }
 
-      engine.store.put(index, buffer)
-      gc()
-    }
+            if (!min) {
+              return false
+            }
 
-    var onhotswap = opts.hotswap === false ? falsy : function (wire, index) {
-      var speed = wire.downloadSpeed()
-      if (speed < piece.BLOCK_LENGTH) return
-      if (!reservations[index] || !pieces[index]) return
+            for (i = 0; i < r.length; i++) {
+              if (r[i] === min) {
+                r[i] = null
+              }
+            }
 
-      var r = reservations[index]
-      var minSpeed = Infinity
-      var min
+            var requests = min.requests
+            var reqs = opts.virtual
+              ? requests.map(function (req) {
+                  var pos = req.piece * verificationLen + req.offset
+                  return {
+                    piece: Math.floor(pos / torrent.pieceLength),
+                    offset: pos % torrent.pieceLength,
+                    callback: req.callback,
+                    timeout: req.timeout,
+                    length: req.length
+                  }
+                })
+              : requests
 
-      for (var i = 0; i < r.length; i++) {
-        var other = r[i]
-        if (!other || other === wire) continue
+            for (i = 0; i < reqs.length; i++) {
+              var req = reqs[i]
+              if (req.piece === index) {
+                pieces[index].cancel((req.offset / piece.BLOCK_SIZE) | 0)
+              }
+            }
 
-        var otherSpeed = other.downloadSpeed()
-        if (otherSpeed >= SPEED_THRESHOLD) continue
-        if (2 * otherSpeed > speed || otherSpeed > minSpeed) continue
+            engine.emit('hotswap', min, wire, index)
+            return true
+          }
 
-        min = other
-        minSpeed = otherSpeed
+    function onupdatetick() {
+      engine.emit('update')
+      if (
+        swarm.downloaded >= engine._flood &&
+        swarm.downloadSpeed() > engine.pulse
+      ) {
+        return delayupdatetick()
       }
-
-      if (!min) return false
-
-      for (i = 0; i < r.length; i++) {
-        if (r[i] === min) r[i] = null
-      }
-
-      for (i = 0; i < min.requests.length; i++) {
-        var req = min.requests[i]
-        if (req.piece !== index) continue
-        pieces[index].cancel((req.offset / piece.BLOCK_SIZE) | 0)
-      }
-
-      engine.emit('hotswap', min, wire, index)
-      return true
-    }
-
-    var onupdatetick = function () {
       process.nextTick(onupdate)
     }
 
-    var onrequest = function (wire, index, hotswap) {
-      if (!pieces[index]) return false
+    var delayupdatetick = debounce(onupdatetick, 500)
+
+    function onrequest(wire, index, hotswap) {
+      if (!pieces[index]) {
+        return false
+      }
 
       var p = pieces[index]
       var reservation = p.reserve()
 
-      if (reservation === -1 && hotswap && onhotswap(wire, index)) reservation = p.reserve()
-      if (reservation === -1) return false
+      if (reservation === -1 && hotswap && onhotswap(wire, index)) {
+        reservation = p.reserve()
+      }
+      if (reservation === -1) {
+        return false
+      }
 
       var r = reservations[index] || []
-      var offset = p.chunkOffset(reservation)
-      var size = p.chunkLength(reservation)
+      var offset = p.offset(reservation)
+      var size = p.size(reservation)
 
       var i = r.indexOf(null)
-      if (i === -1) i = r.length
+      if (i === -1) {
+        i = r.length
+      }
       r[i] = wire
+      ;(function (peer, index, offset, size, cb) {
+        if (!opts.virtual) {
+          return peer.request(index, offset, size, cb)
+        }
+        var pos = index * torrent.pieceLength + offset
+        index = Math.floor(pos / verificationLen)
+        offset = pos % verificationLen
+        peer.request(index, offset, size, cb)
+      })(wire, index, offset, size, function (err, block) {
+        if (r[i] === wire) {
+          r[i] = null
+        }
 
-      wire.request(index, offset, size, function (err, block) {
-        if (r[i] === wire) r[i] = null
-
-        if (p !== pieces[index]) return onupdatetick()
+        if (p !== pieces[index]) {
+          return onupdatetick()
+        }
 
         if (err) {
           p.cancel(reservation)
-          onupdatetick()
-          return
+          return onupdatetick()
         }
 
-        if (!p.set(reservation, block, wire)) return onupdatetick()
+        var ready = !p.set(reservation, block)
+        engine.emit('piece-progress', index, p.buffered / p.parts)
 
-        var sources = p.sources
+        if (ready) {
+          return onupdatetick()
+        }
+
         var buffer = p.flush()
 
-        if (sha1(buffer) !== torrent.pieces[index]) {
-          pieces[index] = piece(p.length)
-          engine.emit('invalid-piece', index, buffer)
-          onupdatetick()
-
-          sources.forEach(function (wire) {
-            var now = Date.now()
-
-            wire.badPieceStrikes = wire.badPieceStrikes.filter(function (strike) {
-              return (now - strike) < BAD_PIECE_STRIKES_DURATION
-            })
-
-            wire.badPieceStrikes.push(now)
-
-            if (wire.badPieceStrikes.length > BAD_PIECE_STRIKES_MAX) {
-              engine.block(wire.peerAddress)
+        ;(function (index, buffer) {
+          if (pieces[index]) {
+            try {
+              engine.store.write(index, buffer)
+            } catch (e) {
+              engine.emit('error', e)
+              return
             }
-          })
 
-          return
-        }
+            engine.bitfield.set(index, true)
+            var ver = engine.store.verify(index, verifications)
 
-        onpiececomplete(index, buffer)
+            if (ver && ver.success) {
+              engine.store.commit(
+                ver.start,
+                ver.end - 1,
+                function (err, noNotifyHave) {
+                  if (err) {
+                    return engine.emit('error', err)
+                  }
+                  for (var j = ver.start; j !== ver.end; j++) {
+                    engine.emit('verify', j)
+                  }
+                  if (!noNotifyHave) {
+                    var idx = mapPiece(index)
+                    engine.verified.set(idx, true)
+                    for (var k = 0; k < wires.length; k++) {
+                      wires[k].have(idx)
+                    }
+                  }
+                }
+              )
+            }
+
+            if (!ver || ver.success) {
+              pieces[index] = null
+              reservations[index] = null
+              engine.emit('download', index, buffer)
+              gc()
+            } else {
+              for (var j = ver.start; j !== ver.end; j++) {
+                engine.emit('invalid-piece', j)
+                resetpiece(j)
+              }
+            }
+          }
+        })(index, buffer)
+
         onupdatetick()
       })
 
       return true
     }
 
-    var onvalidatewire = function (wire) {
-      if (wire.requests.length) return
-
-      for (var i = engine.selection.length - 1; i >= 0; i--) {
-        var next = engine.selection[i]
-        for (var j = next.to; j >= next.from + next.offset; j--) {
-          if (!wire.peerPieces[j]) continue
-          if (onrequest(wire, j, false)) return
-        }
-      }
+    function getRequestsNumber() {
+      var unchoked = wires.filter(function (peer) {
+        return !peer.peerChoking
+      }).length
+      var normalRange = 1 - Math.max(0, Math.min(1, (unchoked - 1) / 29))
+      return Math.round(Math.pow(normalRange, 4) * 45 + 5)
     }
 
-    var speedRanker = function (wire) {
-      var speed = wire.downloadSpeed() || 1
-      if (speed > SPEED_THRESHOLD) return thruthy
-
-      var secs = MAX_REQUESTS * piece.BLOCK_LENGTH / speed
-      var tries = 10
-      var ptr = 0
-
-      return function (index) {
-        if (!tries || !pieces[index]) return true
-
-        var missing = pieces[index].missing
-        for (; ptr < wires.length; ptr++) {
-          var other = wires[ptr]
-          var otherSpeed = other.downloadSpeed()
-
-          if (otherSpeed < SPEED_THRESHOLD) continue
-          if (otherSpeed <= speed || !other.peerPieces[index]) continue
-          if ((missing -= otherSpeed * secs) > 0) continue
-
-          tries--
-          return false
-        }
-
-        return true
-      }
-    }
-
-    var shufflePriority = function (i) {
+    function shufflePriority(i) {
       var last = i
-      for (var j = i; j < engine.selection.length && engine.selection[j].priority; j++) {
+      for (
+        var j = i;
+        j < engine.selection.length && engine.selection[j].priority;
+        j++
+      ) {
         last = j
       }
-      var tmp = engine.selection[i]
-      engine.selection[i] = engine.selection[last]
-      engine.selection[last] = tmp
+      engine.selection.splice(last, 0, engine.selection.splice(i, 1)[0])
     }
 
-    var select = function (wire, hotswap) {
-      if (wire.requests.length >= MAX_REQUESTS) return true
-
-      // Pulse, or flood (default)
-      if (swarm.downloaded > engine._flood && swarm.downloadSpeed() > engine._pulse) {
+    function select(wire, hotswap) {
+      var maxRequests = getRequestsNumber()
+      if (wire.requests.length >= maxRequests) {
         return true
       }
 
-      var rank = speedRanker(wire)
+      var rank = (function (wire) {
+        var speed = wire.downloadSpeed() || 1
+        if (speed > SPEED_THRESHOLD) {
+          return thruthy
+        }
+
+        var secs = (getRequestsNumber() * piece.BLOCK_SIZE) / speed
+        var tries = 10
+        var ptr = 0
+
+        return function (index) {
+          if (!tries || !pieces[index]) {
+            return true
+          }
+          var missing = pieces[index].missing
+          for (; ptr < wires.length; ptr++) {
+            var other = wires[ptr]
+            var otherSpeed = other.downloadSpeed()
+            if (
+              otherSpeed >= SPEED_THRESHOLD &&
+              otherSpeed > speed &&
+              other.peerPieces[mapPiece(index)] &&
+              (missing -= otherSpeed * secs) <= 0
+            ) {
+              tries--
+              return false
+            }
+          }
+          return true
+        }
+      })(wire)
 
       for (var i = 0; i < engine.selection.length; i++) {
         var next = engine.selection[i]
-        for (var j = next.from + next.offset; j <= next.to; j++) {
-          if (!wire.peerPieces[j] || !rank(j)) continue
-          while (wire.requests.length < MAX_REQUESTS && onrequest(wire, j, critical[j] || hotswap)) {}
-          if (wire.requests.length < MAX_REQUESTS) continue
-          if (next.priority) shufflePriority(i)
-          return true
+        for (
+          var j = next.from + next.offset;
+          j <= (next.selectTo || next.to);
+          j++
+        ) {
+          if (wire.peerPieces[mapPiece(j)] && rank(j)) {
+            while (
+              wire.requests.length < maxRequests &&
+              onrequest(wire, j, critical[j] || hotswap)
+            ) {}
+            if (wire.requests.length >= maxRequests) {
+              if (next.priority) {
+                shufflePriority(i)
+              }
+              return true
+            }
+          }
         }
       }
 
       return false
     }
 
-    var onupdatewire = function (wire) {
-      if (wire.peerChoking) return
-      if (!wire.downloaded) return onvalidatewire(wire)
-      select(wire, false) || select(wire, true)
+    function onupdatewire(wire) {
+      if (!wire.peerChoking) {
+        if (wire.downloaded) {
+          if (!select(wire, false)) {
+            select(wire, true)
+          }
+        } else {
+          ;(function (wire) {
+            if (!wire.requests.length) {
+              for (var i = engine.selection.length - 1; i >= 0; i--) {
+                var next = engine.selection[i]
+                for (
+                  var j = next.selectTo || next.to;
+                  j >= next.from + next.offset;
+                  j--
+                ) {
+                  if (
+                    wire.peerPieces[mapPiece(j)] &&
+                    onrequest(wire, j, false)
+                  ) {
+                    return
+                  }
+                }
+              }
+            }
+          })(wire)
+        }
+      }
     }
 
-    var onupdate = function () {
+    function onupdate() {
       wires.forEach(onupdatewire)
     }
 
-    var onwire = function (wire) {
-      wire.setTimeout(opts.timeout || REQUEST_TIMEOUT, function () {
+    function onwire(wire) {
+      wire.setTimeout(opts.timeout || 30000, function () {
         engine.emit('timeout', wire)
         wire.destroy()
       })
 
-      if (engine.selection.length) wire.interested()
+      if (engine.selection.length) {
+        wire.interested()
+      }
 
-      var timeout = CHOKE_TIMEOUT
       var id
 
-      var onchoketimeout = function () {
-        if (swarm.queued > 2 * (swarm.size - swarm.wires.length) && wire.amInterested) return wire.destroy()
-        id = setTimeout(onchoketimeout, timeout)
+      function onchoketimeout() {
+        if (
+          swarm.queued > (swarm.size - swarm.wires.length) * 2 &&
+          wire.amInterested
+        ) {
+          return wire.destroy()
+        }
+        id = setTimeout(onchoketimeout, 5000)
       }
 
       wire.on('close', function () {
@@ -443,66 +618,95 @@ var torrentStream = function (link, opts, cb) {
 
       wire.on('choke', function () {
         clearTimeout(id)
-        id = setTimeout(onchoketimeout, timeout)
+        id = setTimeout(onchoketimeout, 5000)
       })
 
       wire.on('unchoke', function () {
         clearTimeout(id)
       })
 
+      var uploadPipe = new Bagpipe(4)
+
       wire.on('request', function (index, offset, length, cb) {
-        if (pieces[index]) return
-        engine.store.get(index, { offset: offset, length: length }, function (err, buffer) {
-          if (err) return cb(err)
-          engine.emit('upload', index, offset, length)
-          cb(null, buffer)
+        var pos = index * verificationLen + offset
+        index = Math.floor(pos / torrent.pieceLength)
+        offset = pos % torrent.pieceLength
+
+        if (!engine.bitfield.get(index)) {
+          return engine.emit('invalid-request', index)
+        }
+
+        uploadPipe.push(engine.store.read, index, function (err, buffer) {
+          if (err) {
+            return cb(err)
+          } else if (buffer) {
+            engine.emit('upload', index, offset, length)
+            cb(null, buffer.slice(offset, offset + length))
+          } else {
+            return cb(new Error('Empty buffer returned'))
+          }
         })
       })
 
-      wire.on('unchoke', onupdate)
-      wire.on('bitfield', onupdate)
-      wire.on('have', onupdate)
+      wire.on('unchoke', onupdatetick)
+      wire.on('bitfield', onupdatetick)
+      wire.on('have', onupdatetick)
 
       wire.isSeeder = false
 
-      var i = 0
-      var checkseeder = function () {
-        if (wire.peerPieces.length !== torrent.pieces.length) return
-        for (; i < torrent.pieces.length; ++i) {
-          if (!wire.peerPieces[i]) return
+      var idx = 0
+      function checkseeder() {
+        if (wire.peerPieces.length === torrent.pieces.length) {
+          for (; idx < torrent.pieces.length; ++idx) {
+            if (!wire.peerPieces[idx]) {
+              return
+            }
+          }
+          wire.isSeeder = true
         }
-        wire.isSeeder = true
       }
 
       wire.on('bitfield', checkseeder)
       wire.on('have', checkseeder)
       checkseeder()
 
-      wire.badPieceStrikes = []
-
-      id = setTimeout(onchoketimeout, timeout)
+      id = setTimeout(onchoketimeout, 5000)
     }
 
-    var rechokeSort = function (a, b) {
-      // Prefer higher download speed
-      if (a.downSpeed !== b.downSpeed) return a.downSpeed > b.downSpeed ? -1 : 1
-      // Prefer higher upload speed
-      if (a.upSpeed !== b.upSpeed) return a.upSpeed > b.upSpeed ? -1 : 1
-      // Prefer unchoked
-      if (a.wasChoked !== b.wasChoked) return a.wasChoked ? 1 : -1
-      // Random order
-      return a.salt - b.salt
+    function rechokeSort(a, b) {
+      if (a.downSpeed !== b.downSpeed) {
+        return a.downSpeed > b.downSpeed ? -1 : 1
+      } else if (a.upSpeed !== b.upSpeed) {
+        return a.upSpeed > b.upSpeed ? -1 : 1
+      } else if (a.wasChoked !== b.wasChoked) {
+        return a.wasChoked ? 1 : -1
+      } else {
+        return a.salt - b.salt
+      }
     }
 
-    var onrechoke = function () {
-      if (rechokeOptimisticTime > 0) --rechokeOptimisticTime
-      else rechokeOptimistic = null
+    swarm.on('wire', onwire)
+    swarm.wires.forEach(onwire)
+
+    refresh = function () {
+      process.nextTick(gc)
+      oninterestchange()
+      onupdatetick()
+    }
+
+    rechokeIntervalId = setInterval(function () {
+      if (rechokeOptimisticTime > 0) {
+        --rechokeOptimisticTime
+      } else {
+        rechokeOptimistic = null
+      }
 
       var peers = []
-
       wires.forEach(function (wire) {
         if (wire.isSeeder) {
-          if (!wire.amChoking) wire.choke()
+          if (!wire.amChoking) {
+            wire.choke()
+          }
         } else if (wire !== rechokeOptimistic) {
           peers.push({
             wire: wire,
@@ -522,183 +726,157 @@ var torrentStream = function (link, opts, cb) {
       var unchokeInterested = 0
       for (; i < peers.length && unchokeInterested < rechokeSlots; ++i) {
         peers[i].isChoked = false
-        if (peers[i].interested) ++unchokeInterested
+        if (peers[i].interested) {
+          ++unchokeInterested
+        }
       }
 
       if (!rechokeOptimistic && i < peers.length && rechokeSlots) {
-        var candidates = peers.slice(i).filter(function (peer) { return peer.interested })
+        var candidates = peers.slice(i).filter(function (peer) {
+          return peer.interested
+        })
         var optimistic = candidates[(Math.random() * candidates.length) | 0]
 
         if (optimistic) {
           optimistic.isChoked = false
           rechokeOptimistic = optimistic.wire
-          rechokeOptimisticTime = RECHOKE_OPTIMISTIC_DURATION
+          rechokeOptimisticTime = 2
         }
       }
 
       peers.forEach(function (peer) {
         if (peer.wasChoked !== peer.isChoked) {
-          if (peer.isChoked) peer.wire.choke()
-          else peer.wire.unchoke()
+          if (peer.isChoked) {
+            peer.wire.choke()
+          } else {
+            peer.wire.unchoke()
+          }
         }
       })
-    }
+    }, 10000)
 
-    var onready = function () {
-      if (destroyed) return
-      swarm.on('wire', onwire)
-      swarm.wires.forEach(onwire)
-
-      refresh = function () {
-        process.nextTick(gc)
-        oninterestchange()
-        onupdate()
-      }
-
-      rechokeIntervalId = setInterval(onrechoke, RECHOKE_INTERVAL)
-
-      process.nextTick(function () {
-        engine.emit('torrent', torrent)
-        engine.emit('ready')
-        refresh()
-      })
-    }
-
-    if (opts.verify === false) return onready()
-
-    engine.emit('verifying')
-
-    var loop = function (i) {
-      if (i >= torrent.pieces.length) return onready()
-      engine.store.get(i, function (_, buf) {
-        if (!buf || sha1(buf) !== torrent.pieces[i] || !pieces[i]) return loop(i + 1)
-        pieces[i] = null
-        engine.bitfield.set(i, true)
-        engine.emit('verify', i)
-        loop(i + 1)
-      })
-    }
-
-    loop(0)
+    engine.emit('ready')
+    refresh()
   }
 
   var exchange = exchangeMetadata(engine, function (metadata) {
-    var buf = bncode.encode({
-      info: bncode.decode(metadata),
-      'announce-list': []
-    })
+    var result = {}
+    try {
+      result.info = bncode.decode(metadata)
+    } catch (e) {
+      return
+    }
+    result['announce-list'] = []
+    var buf = bncode.encode(result)
+    var tor = parseTorrent(buf)
 
-    ontorrent(parseTorrent(buf))
+    verifications = verifications || tor.pieces
 
-    mkdirp(path.dirname(torrentPath), function (err) {
-      if (err) return engine.emit('error', err)
-      fs.writeFile(torrentPath, buf, function (err) {
-        if (err) engine.emit('error', err)
-      })
+    if (!engine.torrent) {
+      ontorrent(tor)
+    }
+
+    fs.writeFile(torrentPath, buf, function (err) {
+      if (err) {
+        engine.emit('error', err)
+      }
     })
   })
 
   swarm.on('wire', function (wire) {
     engine.emit('wire', wire)
     exchange(wire)
-    if (engine.bitfield) wire.bitfield(engine.bitfield)
+    if (engine.verified) {
+      wire.bitfield(engine.verified)
+    } else if (engine.bitfield) {
+      wire.bitfield(engine.bitfield)
+    }
   })
 
   swarm.pause()
-
-  if (link.files && engine.metadata) {
-    swarm.resume()
-    ontorrent(link)
-  } else {
-    fs.readFile(torrentPath, function (_, buf) {
-      if (destroyed) return
-      swarm.resume()
-
-      // We know only infoHash here, not full infoDictionary.
-      // But infoHash is enough to connect to trackers and get peers.
-      if (!buf) return discovery.setTorrent(link)
-
-      var torrent = parseTorrent(buf)
-
-      // Bad cache file - fetch it again
-      if (torrent.infoHash !== infoHash) return discovery.setTorrent(link)
-
-      if (!torrent.announce || !torrent.announce.length) {
-        opts.trackers = [].concat(opts.trackers || []).concat(link.announce || [])
+  ;(function (next) {
+    if (opts.circularBuffer) {
+      return next()
+    }
+    mkdirp(opts.path, function (err) {
+      if (err) {
+        return next(err)
       }
-
-      engine.metadata = torrent.infoBuffer
-      ontorrent(torrent)
+      fs.readFile(torrentPath, function (_, buf) {
+        try {
+          if (buf) {
+            link = parseTorrent(buf)
+          }
+        } catch (e) {}
+        next()
+      })
     })
-  }
+  })(function (err) {
+    if (err) {
+      return engine.emit('error', err)
+    } else if (link.files && link.pieces) {
+      metadata = encode(link)
+      swarm.resume()
+      if (metadata) {
+        ontorrent(link)
+      }
+    }
+  })
 
   engine.critical = function (piece, width) {
-    for (var i = 0; i < (width || 1); i++) critical[piece + i] = true
+    for (var i = 0; i < (width || 1); i++) {
+      critical[piece + i] = true
+    }
+  }
+
+  engine.isCritical = function (piece) {
+    return critical[piece]
   }
 
   engine.select = function (from, to, priority, notify) {
-    engine.selection.push({
+    var sel = {
       from: from,
       to: to,
       offset: 0,
       priority: toNumber(priority),
       notify: notify || noop
-    })
-
+    }
+    engine.selection.push(sel)
     engine.selection.sort(function (a, b) {
       return b.priority - a.priority
     })
-
     refresh()
+    return sel
   }
 
-  engine.deselect = function (from, to, priority, notify) {
-    notify = notify || noop
-    for (var i = 0; i < engine.selection.length; i++) {
-      var s = engine.selection[i]
-      if (s.from !== from || s.to !== to) continue
-      if (s.priority !== toNumber(priority)) continue
-      if (s.notify !== notify) continue
-      engine.selection.splice(i, 1)
-      i--
-      break
+  engine.deselect = function (sel) {
+    var idx = engine.selection.indexOf(sel)
+    if (idx > -1) {
+      engine.selection.splice(idx, 1)
+      refresh()
     }
+  }
 
+  engine.refresh = function () {
     refresh()
   }
 
   engine.setPulse = function (bps) {
-    // Set minimum byte/second pulse starting now (dynamic)
-    // Eg. Start pulsing at minimum 312 KBps:
-    // engine.setPulse(312*1024)
-
-    engine._pulse = bps
+    engine.pulse = bps
   }
 
   engine.setFlood = function (b) {
-    // Set bytes to flood starting now (dynamic)
-    // Eg. Start flooding for next 10 MB:
-    // engine.setFlood(10*1024*1024)
-
     engine._flood = b + swarm.downloaded
   }
 
   engine.setFloodedPulse = function (b, bps) {
-    // Set bytes to flood before starting a minimum byte/second pulse (dynamic)
-    // Eg. Start flooding for next 10 MB, then start pulsing at minimum 312 KBps:
-    // engine.setFloodedPulse(10*1024*1024, 312*1024)
-
     engine.setFlood(b)
     engine.setPulse(bps)
   }
 
   engine.flood = function () {
-    // Reset flood/pulse values to default (dynamic)
-    // Eg. Flood the network starting now:
-    // engine.flood()
-
     engine._flood = 0
-    engine._pulse = Number.MAX_SAFE_INTEGER
+    engine.pulse = Number.MAX_SAFE_INTEGER
   }
 
   engine.connect = function (addr) {
@@ -709,81 +887,28 @@ var torrentStream = function (link, opts, cb) {
     swarm.remove(addr)
   }
 
-  engine.block = function (addr) {
-    blocked.add(addr.split(':')[0])
-    engine.disconnect(addr)
-    engine.emit('blocking', addr)
-  }
-
-  var removeTorrent = function (cb) {
-    fs.unlink(torrentPath, function (err) {
-      if (err) return cb(err)
-      fs.rmdir(path.dirname(torrentPath), function (err) {
-        if (err && err.code !== 'ENOTEMPTY') return cb(err)
-        cb()
-      })
-    })
-  }
-
-  var removeTmp = function (cb) {
-    if (!usingTmp) return removeTorrent(cb)
-    rimraf(opts.path, function (err) {
-      if (err) return cb(err)
-      removeTorrent(cb)
-    })
-  }
-
-  engine.remove = function (keepPieces, cb) {
-    if (typeof keepPieces === 'function') {
-      cb = keepPieces
-      keepPieces = false
-    }
-
-    if (keepPieces || !engine.store || !engine.store.destroy) return removeTmp(cb)
-
-    engine.store.destroy(function (err) {
-      if (err) return cb(err)
-      removeTmp(cb)
-    })
+  engine.remove = function (cb) {
+    rimraf(engine.path, cb || noop)
   }
 
   engine.destroy = function (cb) {
-    destroyed = true
+    engine.removeAllListeners()
     swarm.destroy()
     clearInterval(rechokeIntervalId)
-    discovery.stop()
-    if (engine.store && engine.store.close) {
+    if (engine.store) {
       engine.store.close(cb)
     } else if (cb) {
       process.nextTick(cb)
     }
   }
 
-  var findPort = function (def, cb) {
-    var net = require('net')
-    var s = net.createServer()
-
-    s.on('error', function () {
-      findPort(0, cb)
-    })
-
-    s.listen(def, function () {
-      var port = s.address().port
-      s.close(function () {
-        engine.listen(port, cb)
-      })
-    })
-  }
-
   engine.listen = function (port, cb) {
-    if (typeof port === 'function') return engine.listen(0, port)
-    if (!port) return findPort(opts.port || DEFAULT_PORT, cb)
-    engine.port = port
+    if (typeof port === 'function') {
+      return engine.listen(0, port)
+    }
+    engine.port = port || 6881
     swarm.listen(engine.port, cb)
-    discovery.updatePort(engine.port)
   }
 
   return engine
 }
-
-module.exports = torrentStream
